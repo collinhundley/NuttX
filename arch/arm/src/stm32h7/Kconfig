@@ -1577,6 +1577,17 @@ config STM32H7_USART_SINGLEWIRE
 		Enable single wire UART support.  The option enables support for the
 		TIOCSSINGLEWIRE ioctl in the STM32H7 serial driver.
 
+config STM32H7_SERIAL_TIMED_HALF_DUPLEX
+	bool "Timed half-duplex packet transport"
+	default n
+	depends on STM32H7_USART_SINGLEWIRE && SERIAL_RXDMA && SERIAL_TXDMA
+	select SERIAL_TIOCEXCL
+	---help---
+		Enable opt-in, exclusive-port half-duplex packet ioctls with
+		conservative receive timing, bounded atomic transmit admission and
+		hardware transmission-complete notification.  Requires an IRQ-safe
+		microsecond clock supplied by the caller.  Normal UARTs are unchanged.
+
 config STM32H7_USART_INVERT
 	bool "Signal Invert Support"
 	default n

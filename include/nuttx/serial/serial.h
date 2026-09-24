@@ -271,6 +271,9 @@ struct uart_dev_s
   /* State data */
 
   uint8_t              open_count;   /* Number of times the device has been opened */
+#ifdef CONFIG_SERIAL_TIOCEXCL
+  bool                 exclusive;    /* Reject additional opens while claimed */
+#endif
   volatile bool        xmitwaiting;  /* true: User waiting for space in xmit.buffer */
   volatile bool        recvwaiting;  /* true: User waiting for data in recv.buffer */
 #ifdef CONFIG_SERIAL_REMOVABLE

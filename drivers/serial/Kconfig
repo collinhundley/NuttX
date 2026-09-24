@@ -164,6 +164,14 @@ config SERIAL_TIOCSERGSTRUCT
 		supports the TIOCSERGSTRUCT ioctl, and (2) this option is selected, then
 		support for the TIOCSERGSTRUCT will be enabled.
 
+config SERIAL_TIOCEXCL
+	bool "Serial exclusive-open ioctls"
+	default n
+	---help---
+		Support TIOCEXCL/TIOCNXCL. An exclusive claim requires that the caller
+		is the only open file, and rejects further opens until released or
+		until the last close. Unclaimed ports retain normal shared opens.
+
 config SERIAL_TERMIOS
 	bool "Serial TERMIOS support"
 	depends on ARCH_HAVE_SERIAL_TERMIOS

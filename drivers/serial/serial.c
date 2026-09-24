@@ -584,6 +584,14 @@ static int uart_open(FAR struct file *filep)
     }
 #endif
 
+#ifdef CONFIG_SERIAL_TIOCEXCL
+  if (dev->exclusive)
+    {
+      ret = -EBUSY;
+      goto errout_with_sem;
+    }
+#endif
+
   /* Start up serial port */
 
   /* Increment the count of references to the device. */
@@ -688,6 +696,9 @@ static int uart_close(FAR struct file *filep)
   /* There are no more references to the port */
 
   dev->open_count = 0;
+#ifdef CONFIG_SERIAL_TIOCEXCL
+  dev->exclusive = false;
+#endif
 
   /* Stop accepting input */
 
@@ -1277,6 +1288,29 @@ static int uart_ioctl(FAR struct file *filep, int cmd, unsigned long arg)
   FAR uart_dev_t   *dev   = inode->i_private;
 
   /* Handle TTY-level IOCTLs here */
+
+#ifdef CONFIG_SERIAL_TIOCEXCL
+  if (cmd == TIOCEXCL || cmd == TIOCNXCL)
+    {
+      int result = uart_takesem(&dev->closesem, true);
+      if (result < 0)
+        {
+          return result;
+        }
+
+      if (cmd == TIOCEXCL && dev->open_count != 1)
+        {
+          result = -EBUSY;
+        }
+      else
+        {
+          dev->exclusive = cmd == TIOCEXCL;
+        }
+
+      uart_givesem(&dev->closesem);
+      return result;
+    }
+#endif
 
   /* Let low-level driver handle the call first */
 

@@ -40,6 +40,10 @@
 #include <nuttx/semaphore.h>
 #include <nuttx/power/pm.h>
 
+#ifdef CONFIG_STM32H7_SERIAL_TIMED_HALF_DUPLEX
+#  include <nuttx/serial/timed_halfduplex.h>
+#endif
+
 #ifdef CONFIG_SERIAL_TERMIOS
 #  include <termios.h>
 #endif
@@ -563,6 +567,41 @@
  * Private Types
  ****************************************************************************/
 
+#ifdef CONFIG_STM32H7_SERIAL_TIMED_HALF_DUPLEX
+struct up_timed_s
+{
+  uint64_t (*clock_us)(void);
+  uint64_t quiet_before_us;
+  uint64_t last_observation_us;
+  uint64_t received_sequence;
+  uint64_t delivered_sequence;
+  uint64_t burst_first_sequence;
+  uint64_t burst_start_lower_us;
+  uint64_t idle_first_sequence;
+  uint64_t idle_end_sequence;
+  uint64_t idle_start_lower_us;
+  uint64_t idle_observed_us;
+  uint64_t tx_complete_us;
+  uint64_t tx_deadline_us;
+  uint32_t saved_cr1;
+  uint32_t saved_cr2;
+  uint32_t saved_cr3;
+  uint32_t rx_overruns;
+  uint16_t saved_ie;
+  uint8_t tx_buffer[SERIAL_THDX_MAX_PACKET]
+    aligned_data(ARMV7M_DCACHE_LINESIZE);
+  uint8_t tx_length;
+  uint8_t tx_position;
+  bool enabled;
+  bool burst_active;
+  bool burst_valid;
+  bool idle_valid;
+  bool tx_busy;
+  bool tx_fault;
+  bool rx_gap_pending;
+};
+#endif
+
 struct up_dev_s
 {
   struct uart_dev_s dev;       /* Generic UART device */
@@ -623,6 +662,10 @@ struct up_dev_s
   const uint32_t    cts_gpio;  /* U[S]ART CTS GPIO pin configuration */
 #endif
 
+#ifdef CONFIG_STM32H7_SERIAL_TIMED_HALF_DUPLEX
+  struct up_timed_s timed;
+#endif
+
   /* TX DMA state */
 
 #ifdef SERIAL_HAVE_TXDMA
@@ -664,6 +707,14 @@ struct pm_config_s
 /****************************************************************************
  * Private Function Prototypes
  ****************************************************************************/
+
+#ifdef CONFIG_STM32H7_SERIAL_TIMED_HALF_DUPLEX
+static void up_timed_observe(struct up_dev_s *priv);
+static void up_timed_idle(struct up_dev_s *priv, uint64_t observed_us);
+static bool up_timed_interrupt(struct up_dev_s *priv);
+static int up_timed_ioctl(struct uart_dev_s *dev, int cmd,
+                          unsigned long arg);
+#endif
 
 static void up_set_format(struct uart_dev_s *dev);
 static int  up_setup(struct uart_dev_s *dev);
@@ -1661,6 +1712,602 @@ static int up_dma_nextrx(struct up_dev_s *priv)
 }
 #endif
 
+#ifdef CONFIG_STM32H7_SERIAL_TIMED_HALF_DUPLEX
+
+/* A timed port currently supports 115200 8N1.  The start bound comes from a
+ * preceding observation of both the DMA position and an empty, idle UART;
+ * it is deliberately not reconstructed from packet length or read time.
+ */
+
+#define TIMED_BAUD             115200u
+#define TIMED_CHARACTER_US     ((10000000u + TIMED_BAUD - 1) / TIMED_BAUD)
+/* Allow less than half a DMA ring between observations.  Besides catching
+ * an exact full wrap, this leaves room for the USART FIFO and an in-flight
+ * character.  A delayed observer sacrifices availability, never continuity.
+ */
+
+#define TIMED_MAX_RX_GAP_US     ((RXDMA_BUFFER_SIZE / 2 - 1) * \
+                                10000000u / TIMED_BAUD)
+#define TIMED_RX_ERRORS        (USART_ISR_PE | USART_ISR_FE | \
+                                USART_ISR_NE | USART_ISR_ORE)
+
+static void up_timed_service(struct up_dev_s *priv);
+
+static void up_timed_drop_rx(struct up_dev_s *priv)
+{
+  struct up_timed_s *timed = &priv->timed;
+
+  /* Modulo DMA position cannot count unobserved full wraps.  Discard the
+   * uncertain bytes and introduce an explicit gap in the application
+   * sequence, so a missing complete control frame cannot appear adjacent
+   * to the next one and qualify an aliased frame period.
+   */
+
+  priv->dev.recv.tail = priv->dev.recv.head;
+  priv->rxdmanext = up_dma_nextrx(priv) % RXDMA_BUFFER_SIZE;
+#ifdef CONFIG_ARMV7M_DCACHE
+  priv->rxdmaavail = 0;
+#endif
+  timed->received_sequence += RXDMA_BUFFER_SIZE;
+  timed->delivered_sequence = timed->received_sequence;
+  timed->burst_active = false;
+  timed->burst_valid = false;
+  timed->idle_valid = false;
+  timed->rx_gap_pending = false;
+  timed->quiet_before_us = 0;
+  timed->last_observation_us = timed->clock_us();
+  timed->rx_overruns++;
+}
+
+static void up_timed_rx_status(struct up_dev_s *priv, uint8_t status)
+{
+  if (priv->timed.enabled &&
+      ((status & DMA_STATUS_ERROR) != 0 ||
+       (status & (DMA_STATUS_HTIF | DMA_STATUS_TCIF)) ==
+       (DMA_STATUS_HTIF | DMA_STATUS_TCIF)))
+    {
+      up_timed_drop_rx(priv);
+    }
+}
+
+static void up_timed_abort(struct up_dev_s *priv)
+{
+  struct up_timed_s *timed = &priv->timed;
+
+  /* Never retry a partial packet.  Disable the UART before flushing its
+   * FIFO so that even a stalled DMA cannot resume outside the reply slot.
+   */
+
+  stm32_dmastop(priv->txdma);
+  up_serialmod(priv, STM32_USART_CR1_OFFSET, USART_CR1_UE, 0);
+  up_serialout(priv, STM32_USART_RQR_OFFSET, USART_RQR_TXFRQ);
+  up_serialmod(priv, STM32_USART_CR3_OFFSET, USART_CR3_DMAT,
+               timed->saved_cr3 & USART_CR3_DMAT);
+  up_serialout(priv, STM32_USART_CR1_OFFSET, timed->saved_cr1);
+  up_setusartint(priv, timed->saved_ie);
+  timed->tx_busy = false;
+  timed->tx_fault = true;
+  timed->quiet_before_us = 0;
+  timed->last_observation_us = timed->clock_us();
+}
+
+static void up_timed_snapshot(struct up_dev_s *priv,
+                              struct serial_thdx_status_s *status)
+{
+  struct up_timed_s *timed = &priv->timed;
+
+  up_timed_service(priv);
+  memset(status, 0, sizeof(*status));
+  status->tx_busy = timed->tx_busy;
+  status->tx_fault = timed->tx_fault;
+  status->tx_complete_us = timed->tx_complete_us;
+  status->rx_overruns = timed->rx_overruns;
+
+  if (timed->burst_active)
+    {
+      status->first_sequence = timed->burst_first_sequence;
+      status->end_sequence = timed->received_sequence;
+      status->start_lower_bound_us = timed->burst_start_lower_us;
+      status->timing_valid = timed->burst_valid;
+    }
+  else
+    {
+      status->first_sequence = timed->idle_first_sequence;
+      status->end_sequence = timed->idle_end_sequence;
+      status->start_lower_bound_us = timed->idle_start_lower_us;
+      status->idle_observed_us = timed->idle_observed_us;
+      status->timing_valid = timed->idle_valid;
+    }
+}
+
+static void up_timed_observe(struct up_dev_s *priv)
+{
+  struct up_timed_s *timed = &priv->timed;
+  uint64_t before_us;
+  uint32_t position;
+  uint32_t status;
+
+  up_timed_service(priv);
+  if (!timed->enabled || timed->tx_busy)
+    {
+      return;
+    }
+
+  before_us = timed->clock_us();
+  if (timed->rx_gap_pending ||
+      (timed->last_observation_us != 0 &&
+       (before_us < timed->last_observation_us ||
+        before_us - timed->last_observation_us >= TIMED_MAX_RX_GAP_US)))
+    {
+      up_timed_drop_rx(priv);
+      return;
+    }
+
+  timed->last_observation_us = before_us;
+  position = up_dma_nextrx(priv);
+  status = up_serialin(priv, STM32_USART_ISR_OFFSET);
+
+  if ((status & TIMED_RX_ERRORS) != 0)
+    {
+      up_timed_drop_rx(priv);
+      return;
+    }
+
+  if (position != priv->rxdmanext)
+    {
+      if (!timed->burst_active)
+        {
+          timed->burst_active = true;
+          timed->burst_first_sequence = timed->received_sequence;
+          timed->burst_start_lower_us = timed->quiet_before_us;
+          timed->burst_valid = timed->quiet_before_us != 0 &&
+                               (status & TIMED_RX_ERRORS) == 0;
+          timed->idle_valid = false;
+        }
+    }
+  else if (!timed->burst_active &&
+           (status & (USART_ISR_BUSY | USART_ISR_RXNE |
+                      TIMED_RX_ERRORS)) == 0 &&
+           position == up_dma_nextrx(priv))
+    {
+      /* Take an additional character of margin for DMA/peripheral
+       * observation ordering.  Delayed polling makes this bound older,
+       * which can suppress a reply but never makes it artificially fresh.
+       */
+
+      timed->quiet_before_us = before_us > TIMED_CHARACTER_US ?
+                               before_us - TIMED_CHARACTER_US : 0;
+    }
+}
+
+static void up_timed_idle(struct up_dev_s *priv, uint64_t observed_us)
+{
+  struct up_timed_s *timed = &priv->timed;
+  uint32_t status;
+
+  if (!timed->enabled || timed->tx_busy || !timed->burst_active)
+    {
+      return;
+    }
+
+  status = up_serialin(priv, STM32_USART_ISR_OFFSET);
+  if ((status & (USART_ISR_BUSY | USART_ISR_RXNE | TIMED_RX_ERRORS)) != 0 ||
+      up_dma_nextrx(priv) != priv->rxdmanext)
+    {
+      /* An old IDLE flag may be serviced after another byte has started.
+       * Do not turn that delayed interrupt into a fresh reply opportunity.
+       */
+
+      timed->idle_valid = false;
+      return;
+    }
+
+  timed->idle_first_sequence = timed->burst_first_sequence;
+  timed->idle_end_sequence = timed->received_sequence;
+  timed->idle_start_lower_us = timed->burst_start_lower_us;
+  timed->idle_observed_us = observed_us;
+  timed->idle_valid = timed->burst_valid;
+  timed->burst_active = false;
+  up_timed_observe(priv);
+}
+
+static void up_timed_dma_callback(DMA_HANDLE handle, uint8_t status,
+                                  void *arg)
+{
+  struct up_dev_s *priv = (struct up_dev_s *)arg;
+  struct up_timed_s *timed = &priv->timed;
+
+  (void)handle;
+  if (!timed->enabled || !timed->tx_busy)
+    {
+      return;
+    }
+
+  if ((status & DMA_STATUS_ERROR) != 0)
+    {
+      up_timed_abort(priv);
+      return;
+    }
+
+  if ((status & DMA_STATUS_TCIF) != 0)
+    {
+      timed->tx_position = timed->tx_length;
+      up_setusartint(priv, (priv->ie & ~USART_CR1_TXEIE) | USART_CR1_TCIE);
+    }
+}
+
+static bool up_timed_interrupt(struct up_dev_s *priv)
+{
+  struct up_timed_s *timed = &priv->timed;
+
+  if (!timed->enabled || !timed->tx_busy)
+    {
+      return false;
+    }
+
+  if (timed->tx_position == timed->tx_length &&
+      (up_serialin(priv, STM32_USART_ISR_OFFSET) & USART_ISR_TC) != 0)
+    {
+      /* DMA completion and TXE do not include the final stop bit.  Only
+       * TC permits receiver restoration.  RE was disabled during TX, so
+       * local echo never enters the RX DMA/ring buffers.
+       */
+
+      up_setusartint(priv, priv->ie & ~(USART_CR1_TXEIE | USART_CR1_TCIE));
+      up_serialout(priv, STM32_USART_ICR_OFFSET, USART_ICR_IDLECF);
+      up_serialmod(priv, STM32_USART_CR3_OFFSET, USART_CR3_DMAT,
+                   timed->saved_cr3 & USART_CR3_DMAT);
+      up_serialmod(priv, STM32_USART_CR1_OFFSET, 0, USART_CR1_RE);
+      timed->tx_complete_us = timed->clock_us();
+      timed->last_observation_us = timed->tx_complete_us;
+      timed->tx_busy = false;
+      timed->quiet_before_us = 0;
+    }
+
+  return true;
+}
+
+static void up_timed_service(struct up_dev_s *priv)
+{
+  struct up_timed_s *timed = &priv->timed;
+
+  if (!timed->enabled || !timed->tx_busy)
+    {
+      return;
+    }
+
+  /* The existing DMA poll and status reads also recover a missing DMA/TC
+   * interrupt.  DMA clocks the entire admitted packet autonomously; CPU
+   * latency therefore cannot insert late bytes into the bus.  An abnormal
+   * transfer is aborted at the first poll after its bounded wire time.
+   */
+
+  if (stm32_dmaresidual(priv->txdma) == 0 &&
+      (up_serialin(priv, STM32_USART_ISR_OFFSET) & USART_ISR_TC) != 0)
+    {
+      timed->tx_position = timed->tx_length;
+      up_timed_interrupt(priv);
+    }
+  else if (timed->clock_us() > timed->tx_deadline_us)
+    {
+      up_timed_abort(priv);
+    }
+}
+
+static int up_timed_configure(struct uart_dev_s *dev,
+                              const struct serial_thdx_config_s *config)
+{
+  struct up_dev_s *priv = (struct up_dev_s *)dev->priv;
+  struct up_timed_s *timed = &priv->timed;
+  uint32_t cr1;
+
+  if (!config->enable)
+    {
+      if (timed->enabled)
+        {
+          /* Stop/error is allowed to abort a packet.  Disable the UART
+           * before changing pins, so the abandoned packet cannot drive
+           * the line after this reset returns.
+           */
+
+          stm32_dmastop(priv->txdma);
+          up_serialmod(priv, STM32_USART_CR1_OFFSET,
+                       USART_CR1_UE | USART_CR1_TE | USART_CR1_RE, 0);
+          up_serialout(priv, STM32_USART_RQR_OFFSET,
+                       USART_RQR_TXFRQ | USART_RQR_RXFRQ);
+          stm32_configgpio(priv->tx_gpio);
+          up_serialout(priv, STM32_USART_CR2_OFFSET, timed->saved_cr2);
+          up_serialout(priv, STM32_USART_CR3_OFFSET,
+                       timed->saved_cr3 & ~USART_CR3_HDSEL);
+          up_serialout(priv, STM32_USART_CR1_OFFSET, timed->saved_cr1);
+          up_setusartint(priv, timed->saved_ie);
+          memset(timed, 0, sizeof(*timed));
+        }
+
+      return OK;
+    }
+
+  if (timed->enabled || dev->open_count != 1 || !dev->exclusive ||
+      dev->xmit.head != dev->xmit.tail)
+    {
+      return -EBUSY;
+    }
+
+  if (config->clock_us == NULL || priv->rxdma == NULL ||
+      priv->txdma == NULL || priv->tx_gpio == 0 ||
+      priv->baud != TIMED_BAUD || priv->bits != 8 ||
+      priv->parity != 0 || priv->stopbits2)
+    {
+      return -ENOTSUP;
+    }
+
+#ifdef CONFIG_SERIAL_IFLOWCONTROL
+  if (priv->iflow)
+    {
+      return -EINVAL;
+    }
+
+#endif
+#ifdef CONFIG_SERIAL_OFLOWCONTROL
+  if (priv->oflow)
+    {
+      return -EINVAL;
+    }
+
+#endif
+#ifdef SERIAL_HAVE_TXDMA
+  if (priv->txdma != NULL &&
+      (dev->dmatx.length != 0 || dev->dmatx.nlength != 0 ||
+       stm32_dmaresidual(priv->txdma) != 0))
+    {
+      return -EBUSY;
+    }
+#endif
+
+  memset(timed, 0, sizeof(*timed));
+  timed->clock_us = config->clock_us;
+  timed->saved_cr1 = up_serialin(priv, STM32_USART_CR1_OFFSET);
+  timed->saved_cr2 = up_serialin(priv, STM32_USART_CR2_OFFSET);
+  timed->saved_cr3 = up_serialin(priv, STM32_USART_CR3_OFFSET);
+  timed->saved_ie = priv->ie;
+
+  cr1 = timed->saved_cr1 & ~USART_CR1_UE;
+  up_serialout(priv, STM32_USART_CR1_OFFSET, cr1);
+  stm32_configgpio((priv->tx_gpio & ~(GPIO_PUPD_MASK | GPIO_OPENDRAIN)) |
+                   GPIO_OPENDRAIN | GPIO_PULLUP);
+  up_serialmod(priv, STM32_USART_CR2_OFFSET,
+               USART_CR2_RXINV | USART_CR2_TXINV | USART_CR2_SWAP, 0);
+  up_serialmod(priv, STM32_USART_CR3_OFFSET, 0, USART_CR3_HDSEL);
+  up_serialout(priv, STM32_USART_CR1_OFFSET, timed->saved_cr1);
+
+  /* Discard pre-configuration input and align the software sequence with
+   * the actual receive stream.  There is no timestamp until a clean idle
+   * observation followed by the first new DMA byte.
+   */
+
+  dev->recv.tail = dev->recv.head;
+  priv->rxdmanext = up_dma_nextrx(priv) % RXDMA_BUFFER_SIZE;
+#ifdef CONFIG_ARMV7M_DCACHE
+  priv->rxdmaavail = 0;
+#endif
+  timed->enabled = true;
+  up_timed_observe(priv);
+  return OK;
+}
+
+static int up_timed_transmit(struct uart_dev_s *dev,
+                             const struct serial_thdx_tx_s *packet)
+{
+  struct up_dev_s *priv = (struct up_dev_s *)dev->priv;
+  struct up_timed_s *timed = &priv->timed;
+  uint64_t now_us;
+  uint64_t frame_budget_us;
+  uint64_t request_end_lower_us;
+  uint64_t reserve_us;
+  uint32_t status;
+  struct stm32_dma_config_s txconfig;
+
+  if (packet->buffer == NULL || packet->length == 0 ||
+      packet->length > SERIAL_THDX_MAX_PACKET ||
+      packet->request_first_sequence >= packet->request_end_sequence ||
+      packet->frame_period_us == 0 || packet->max_idle_age_us == 0)
+    {
+      return -EINVAL;
+    }
+
+  if (timed->tx_fault)
+    {
+      return -EIO;
+    }
+
+  if (dev->open_count != 1 || timed->tx_busy ||
+      dev->xmit.head != dev->xmit.tail)
+    {
+      return -EBUSY;
+    }
+
+  if (packet->request_end_sequence != timed->received_sequence ||
+      packet->request_end_sequence != timed->delivered_sequence ||
+      dev->recv.head != dev->recv.tail)
+    {
+      return -ESTALE;
+    }
+
+  if (timed->burst_active ||
+      timed->idle_end_sequence != packet->request_end_sequence)
+    {
+      return -EAGAIN;
+    }
+
+  if (!timed->idle_valid || timed->idle_start_lower_us == 0 ||
+      packet->request_first_sequence < timed->idle_first_sequence)
+    {
+      return -ENODATA;
+    }
+
+#ifdef SERIAL_HAVE_TXDMA
+  if (priv->txdma != NULL &&
+      (dev->dmatx.length != 0 || dev->dmatx.nlength != 0 ||
+       stm32_dmaresidual(priv->txdma) != 0))
+    {
+      return -EBUSY;
+    }
+#endif
+
+  /* Copy before the final admission checks.  The first byte is written
+   * inside this same critical section: no later worker or DMA queue may
+   * begin a packet whose reply window has already expired.
+   */
+
+  memcpy(timed->tx_buffer, packet->buffer, packet->length);
+  up_clean_dcache((uintptr_t)timed->tx_buffer,
+                  (uintptr_t)timed->tx_buffer + packet->length);
+  stm32_dmastop(priv->txdma);
+  txconfig.paddr = priv->usartbase + STM32_USART_TDR_OFFSET;
+  txconfig.maddr = (uint32_t)timed->tx_buffer;
+  txconfig.ndata = packet->length;
+  txconfig.cfg1 = SERIAL_TXDMA_CONTROL_WORD;
+  txconfig.cfg2 = 0;
+  now_us = timed->clock_us();
+  if (now_us < timed->idle_observed_us ||
+      now_us < timed->idle_start_lower_us)
+    {
+      return -ESTALE;
+    }
+
+  /* IDLE itself represents one character of idle.  Waiting one further
+   * character after observing it conservatively supplies the required two.
+   */
+
+  if (now_us - timed->idle_observed_us < TIMED_CHARACTER_US)
+    {
+      return -EAGAIN;
+    }
+
+  /* Minimum wire duration added to an earlier start observation is a
+   * lower bound on the request's end.  Gaps or preceding bytes only make
+   * this bound older.  Unlike an IDLE ISR timestamp, it cannot rejuvenate
+   * the request when interrupt handling is delayed.
+   */
+
+  request_end_lower_us = timed->idle_start_lower_us +
+    (packet->request_end_sequence - packet->request_first_sequence) *
+    10000000u / TIMED_BAUD;
+  if (now_us < request_end_lower_us ||
+      now_us - request_end_lower_us > packet->max_idle_age_us)
+    {
+      return -ETIMEDOUT;
+    }
+
+  reserve_us = ((uint64_t)packet->length * 10000000u + TIMED_BAUD - 1) /
+               TIMED_BAUD + 2 * TIMED_CHARACTER_US + packet->guard_us;
+  frame_budget_us = now_us - timed->idle_start_lower_us + reserve_us;
+  if (frame_budget_us >= packet->frame_period_us ||
+      now_us - timed->idle_observed_us > packet->max_idle_age_us)
+    {
+      return -ETIMEDOUT;
+    }
+
+  status = up_serialin(priv, STM32_USART_ISR_OFFSET);
+  if ((status & (USART_ISR_BUSY | USART_ISR_RXNE | TIMED_RX_ERRORS)) != 0 ||
+      up_dma_nextrx(priv) != priv->rxdmanext)
+    {
+      return -ESTALE;
+    }
+
+  if ((status & USART_ISR_TC) == 0)
+    {
+      return -EBUSY;
+    }
+
+  up_serialmod(priv, STM32_USART_CR1_OFFSET, USART_CR1_RE, 0);
+  up_serialmod(priv, STM32_USART_CR3_OFFSET, 0, USART_CR3_DMAT);
+  up_serialout(priv, STM32_USART_ICR_OFFSET,
+               USART_ICR_TCCF | USART_ICR_IDLECF);
+  timed->tx_position = 0;
+  timed->tx_deadline_us = now_us + reserve_us - 2 * TIMED_CHARACTER_US;
+  timed->tx_length = packet->length;
+  timed->tx_busy = true;
+  timed->idle_valid = false;
+  timed->quiet_before_us = 0;
+  stm32_dmasetup(priv->txdma, &txconfig);
+  stm32_dmastart(priv->txdma, up_timed_dma_callback, priv, false);
+  return OK;
+}
+
+static int up_timed_ioctl(struct uart_dev_s *dev, int cmd,
+                          unsigned long arg)
+{
+  struct up_dev_s *priv = (struct up_dev_s *)dev->priv;
+  struct up_timed_s *timed = &priv->timed;
+  irqstate_t flags;
+  int ret = OK;
+
+  if (arg == 0)
+    {
+      return -EINVAL;
+    }
+
+  flags = enter_critical_section();
+  if (cmd == TIOCSTIMEDHDX)
+    {
+      ret = up_timed_configure(dev,
+                              (const struct serial_thdx_config_s *)arg);
+    }
+  else if (!timed->enabled)
+    {
+      ret = -ENOTSUP;
+    }
+  else if (cmd == TIOCGTIMEDHDX)
+    {
+      up_timed_observe(priv);
+      up_timed_snapshot(priv, (struct serial_thdx_status_s *)arg);
+    }
+  else if (cmd == TIOCGRXTIMEDHDX)
+    {
+      struct serial_thdx_read_s *request =
+        (struct serial_thdx_read_s *)arg;
+
+      if (request->buffer == NULL || request->capacity == 0 ||
+          request->capacity > 2 * SERIAL_THDX_MAX_PACKET)
+        {
+          ret = -EINVAL;
+        }
+      else
+        {
+          up_timed_observe(priv);
+          request->length = 0;
+          request->first_sequence = timed->delivered_sequence;
+          while (request->length < request->capacity &&
+                 dev->recv.tail != dev->recv.head)
+            {
+              request->buffer[request->length++] =
+                dev->recv.buffer[dev->recv.tail];
+              if (++dev->recv.tail >= dev->recv.size)
+                {
+                  dev->recv.tail = 0;
+                }
+            }
+
+          timed->delivered_sequence += request->length;
+          request->end_sequence = timed->delivered_sequence;
+          up_timed_snapshot(priv, &request->status);
+        }
+    }
+  else if (cmd == TIOCSTXTIMEDHDX)
+    {
+      ret = up_timed_transmit(dev, (const struct serial_thdx_tx_s *)arg);
+    }
+  else
+    {
+      ret = -ENOTTY;
+    }
+
+  leave_critical_section(flags);
+  return ret;
+}
+#endif /* CONFIG_STM32H7_SERIAL_TIMED_HALF_DUPLEX */
+
 /****************************************************************************
  * Name: up_set_format
  *
@@ -2294,6 +2941,16 @@ static void up_shutdown(struct uart_dev_s *dev)
   struct up_dev_s *priv = (struct up_dev_s *)dev->priv;
   uint32_t regval;
 
+#ifdef CONFIG_STM32H7_SERIAL_TIMED_HALF_DUPLEX
+  if (priv->timed.enabled)
+    {
+      struct serial_thdx_config_s config;
+
+      memset(&config, 0, sizeof(config));
+      up_timed_ioctl(dev, TIOCSTIMEDHDX, (unsigned long)&config);
+    }
+#endif
+
   /* Mark device as uninitialized. */
 
   priv->initialized = false;
@@ -2485,6 +3142,13 @@ static int up_interrupt(int irq, void *context, void *arg)
 
   priv->sr = up_serialin(priv, STM32_USART_ISR_OFFSET);
 
+#ifdef CONFIG_STM32H7_SERIAL_TIMED_HALF_DUPLEX
+  if (up_timed_interrupt(priv))
+    {
+      return OK;
+    }
+#endif
+
   /* USART interrupts:
    *
    * Enable           Status          Meaning                 Usage
@@ -2532,10 +3196,17 @@ static int up_interrupt(int irq, void *context, void *arg)
 
   if ((priv->sr & USART_ISR_IDLE) != 0)
     {
+#ifdef CONFIG_STM32H7_SERIAL_TIMED_HALF_DUPLEX
+      uint64_t observed_us = priv->timed.enabled ?
+                             priv->timed.clock_us() : 0;
+#endif
       up_serialout(priv, STM32_USART_ICR_OFFSET, USART_ICR_IDLECF);
       if (priv->rxdma != 0)
         {
           up_dma_rxcallback(priv->rxdma, 0, priv);
+#ifdef CONFIG_STM32H7_SERIAL_TIMED_HALF_DUPLEX
+          up_timed_idle(priv, observed_us);
+#endif
         }
     }
 #endif
@@ -2603,6 +3274,14 @@ static int up_ioctl(struct file *filep, int cmd, unsigned long arg)
   struct up_dev_s   *priv  = (struct up_dev_s *)dev->priv;
 #endif
   int                ret   = OK;
+
+#ifdef CONFIG_STM32H7_SERIAL_TIMED_HALF_DUPLEX
+  if (cmd == TIOCSTIMEDHDX || cmd == TIOCGRXTIMEDHDX ||
+      cmd == TIOCSTXTIMEDHDX || cmd == TIOCGTIMEDHDX)
+    {
+      return up_timed_ioctl(dev, cmd, arg);
+    }
+#endif
 
   switch (cmd)
     {
@@ -3222,6 +3901,29 @@ static int up_dma_receive(struct uart_dev_s *dev, unsigned int *status)
 
       c = priv->rxfifo[priv->rxdmanext];
 
+#ifdef CONFIG_STM32H7_SERIAL_TIMED_HALF_DUPLEX
+      if (priv->timed.enabled)
+        {
+          unsigned int nexthead = dev->recv.head + 1;
+          if (nexthead >= dev->recv.size)
+            {
+              nexthead = 0;
+            }
+
+          if (nexthead == dev->recv.tail)
+            {
+              priv->timed.rx_gap_pending = true;
+              priv->timed.burst_valid = false;
+              priv->timed.idle_valid = false;
+              priv->timed.quiet_before_us = 0;
+            }
+          else
+            {
+              priv->timed.received_sequence++;
+            }
+        }
+#endif
+
       priv->rxdmanext++;
       if (priv->rxdmanext == RXDMA_BUFFER_SIZE)
         {
@@ -3614,10 +4316,22 @@ static void up_dma_rxcallback(DMA_HANDLE handle, uint8_t status, void *arg)
 {
   struct up_dev_s *priv = (struct up_dev_s *)arg;
 
+#ifdef CONFIG_STM32H7_SERIAL_TIMED_HALF_DUPLEX
+  up_timed_rx_status(priv, status);
+  up_timed_observe(priv);
+#endif
+
   if (priv->rxenable && up_dma_rxavailable(&priv->dev))
     {
       uart_recvchars(&priv->dev);
     }
+
+#ifdef CONFIG_STM32H7_SERIAL_TIMED_HALF_DUPLEX
+  if (priv->timed.enabled && priv->timed.rx_gap_pending)
+    {
+      up_timed_drop_rx(priv);
+    }
+#endif
 
   /* Get the masked USART status word to check and clear error flags.
    *
