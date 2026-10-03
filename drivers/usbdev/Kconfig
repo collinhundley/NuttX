@@ -1220,4 +1220,17 @@ config CDCECM_BOARD_SERIALSTR
 endif # !CDCECM_COMPOSITE
 endif # CDCECM
 
+menuconfig NET_CDCNCM
+	bool "Compact CDC-NCM Ethernet-over-USB"
+	depends on USBDEV_COMPOSITE && SCHED_LPWORK && !USBDEV_DUALSPEED
+	depends on NET && NETDEVICES && NET_ETHERNET
+	select NETDEV_LATEINIT
+	select CDCNCM_COMPOSITE
+	---help---
+		Full-speed, composite NCM 1.0 backport with NTB16 and 2 KiB buffers.
+		Requires one LPWORK thread and IPv4 networking.
+
+config CDCNCM_COMPOSITE
+	bool
+
 endif # USBDEV

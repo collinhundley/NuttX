@@ -986,6 +986,7 @@ FAR void *composite_initialize(uint8_t ndevices,
 
       priv->cfgdescsize += priv->device[i].compdesc.cfgdescsize;
       priv->ninterfaces += priv->device[i].compdesc.devinfo.ninterfaces;
+      priv->ndevices++;
     }
 
   priv->ndevices = ndevices;
@@ -1013,6 +1014,16 @@ FAR void *composite_initialize(uint8_t ndevices,
   return (FAR void *)alloc;
 
 errout_with_alloc:
+  /* usbdev_register() unwinds a failed bind. Release all successfully
+   * created class objects, including their registered device nodes.
+   */
+
+  for (i = 0; i < priv->ndevices; i++)
+    {
+      priv->device[i].compdesc.uninitialize(priv->device[i].dev);
+      priv->device[i].compdesc.uninitialize(priv->device[i].dev);
+    }
+
   kmm_free(alloc);
   return NULL;
 }
